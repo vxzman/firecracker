@@ -1709,7 +1709,10 @@ definitions:
         type: string
       host_dev_name:
         type: string
-        description: Host level path for the guest network interface
+        description:
+          Host interface name backing the guest NIC. Either a persistent TUN/TAP
+          device (for example tap0) or an existing macvtap device (for example
+          macvtap0). Firecracker does not create or delete macvtap devices.
       iface_id:
         type: string
       mtu:
@@ -1831,7 +1834,7 @@ definitions:
       host_dev_name:
         type: string
         description:
-          The new host device of the interface
+          The new host TUN/TAP or macvtap device name.
   VsockOverride:
     type: object
     description:

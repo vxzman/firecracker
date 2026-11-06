@@ -5,7 +5,7 @@ use std::ffi::{CStr, CString, OsString};
 use std::fs::{self, File, OpenOptions, Permissions, canonicalize, read_to_string};
 use std::io;
 use std::io::Write;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt, fchown};
 use std::os::unix::io::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
@@ -131,6 +131,14 @@ pub struct Env {
     cgroup_conf: Option<CgroupConfiguration>,
     resource_limits: ResourceLimits,
     uffd_dev_minor: Option<u32>,
+    macvtap_ifaces: Vec<String>,
+}
+
+#[derive(Debug)]
+struct MacvtapNode {
+    if_name: String,
+    major: u32,
+    minor: u32,
 }
 
 /// Creates a new file owned by the given uid/gid at `dst` and writes `line`
@@ -276,6 +284,19 @@ impl Env {
 
         let uffd_dev_minor = Self::get_userfaultfd_minor_dev_number().ok();
 
+        let mut macvtap_ifaces = Vec::new();
+        if let Some(names) = arguments.multiple_values("macvtap") {
+            for name in names {
+                Self::validate_macvtap_name(name)?;
+                if macvtap_ifaces.iter().any(|existing| existing == name) {
+                    return Err(JailerError::Macvtap(format!(
+                        "`{name}` specified more than once"
+                    )));
+                }
+                macvtap_ifaces.push(name.clone());
+            }
+        }
+
         Ok(Env {
             id: id.to_owned(),
             chroot_dir,
@@ -292,7 +313,104 @@ impl Env {
             cgroup_conf,
             resource_limits,
             uffd_dev_minor,
+            macvtap_ifaces,
         })
+    }
+
+    /// Interface names accepted by the kernel (`dev_valid_name`) and safe as one path component.
+    fn validate_macvtap_name(if_name: &str) -> Result<(), JailerError> {
+        let valid = !if_name.is_empty()
+            && if_name.len() < 16
+            && if_name != "."
+            && if_name != ".."
+            && if_name.bytes().all(|byte| {
+                !byte.is_ascii_whitespace() && byte != b'/' && byte != b':' && byte != 0
+            });
+        if valid {
+            Ok(())
+        } else {
+            Err(JailerError::Macvtap(format!(
+                "invalid interface name `{if_name}`"
+            )))
+        }
+    }
+
+    /// Resolve macvtap device nodes while `/sys` and `/dev` still refer to the host.
+    ///
+    /// Called after an optional `setns` so the ifindex matches the namespace the guest will
+    /// use. The major/minor pair is captured here because sysfs is not available after chroot.
+    fn resolve_macvtap_nodes(&self) -> Result<Vec<MacvtapNode>, JailerError> {
+        self.macvtap_ifaces
+            .iter()
+            .map(|if_name| Self::resolve_macvtap_node(if_name.as_str()))
+            .collect()
+    }
+
+    fn resolve_macvtap_node(if_name: &str) -> Result<MacvtapNode, JailerError> {
+        Self::validate_macvtap_name(if_name)?;
+
+        let ifindex_path = PathBuf::from(format!("/sys/class/net/{if_name}/ifindex"));
+        let ifindex_text = fs::read_to_string(&ifindex_path).map_err(|err| {
+            JailerError::Macvtap(format!(
+                "interface `{if_name}` was not found ({err}). Create the macvtap device before \
+                 starting the jailer"
+            ))
+        })?;
+        let ifindex: u32 = ifindex_text.trim().parse().map_err(|_| {
+            JailerError::Macvtap(format!(
+                "could not parse ifindex for `{if_name}` from {}",
+                ifindex_path.display()
+            ))
+        })?;
+        if ifindex == 0 {
+            return Err(JailerError::Macvtap(format!(
+                "interface `{if_name}` has ifindex 0"
+            )));
+        }
+
+        let class_path = PathBuf::from(format!("/sys/class/macvtap/tap{ifindex}"));
+        if !class_path.exists() {
+            return Err(JailerError::Macvtap(format!(
+                "`{if_name}` is not a macvtap device (missing {})",
+                class_path.display()
+            )));
+        }
+
+        let dev_path = PathBuf::from(format!("/dev/tap{ifindex}"));
+        let metadata = fs::metadata(&dev_path).map_err(|err| {
+            JailerError::Macvtap(format!(
+                "failed to stat {} for `{if_name}`: {err}",
+                dev_path.display()
+            ))
+        })?;
+        if !metadata.file_type().is_char_device() {
+            return Err(JailerError::Macvtap(format!(
+                "{} is not a character device",
+                dev_path.display()
+            )));
+        }
+
+        Ok(MacvtapNode {
+            if_name: if_name.to_owned(),
+            major: libc::major(metadata.rdev()),
+            minor: libc::minor(metadata.rdev()),
+        })
+    }
+
+    fn expose_macvtap_nodes(&self, nodes: &[MacvtapNode]) -> Result<(), JailerError> {
+        if nodes.is_empty() {
+            return Ok(());
+        }
+
+        // Firecracker opens this path by interface name. The host node is `/dev/tap<ifindex>`,
+        // which the jailed process cannot see.
+        self.setup_jailed_folder("/dev/tap")?;
+        for node in nodes {
+            let dev_path = CString::new(format!("/dev/tap/{}", node.if_name))
+                .map_err(JailerError::CStringParsing)?;
+            self.mknod_and_own_dev(&dev_path, node.major, node.minor)?;
+        }
+        Ok(())
     }
 
     pub fn chroot_dir(&self) -> &Path {
@@ -652,6 +770,10 @@ impl Env {
             Env::join_netns(path)?;
         }
 
+        // Resolve macvtap device numbers after joining the namespace and before chroot.
+        // `/sys` and the host `/dev/tapN` nodes are not visible inside the jail.
+        let macvtap_nodes = self.resolve_macvtap_nodes()?;
+
         // Set limits on resources.
         self.resource_limits.install()?;
 
@@ -711,6 +833,8 @@ impl Env {
         if let Some(minor) = self.uffd_dev_minor {
             self.mknod_and_own_dev(DEV_UFFD_PATH, DEV_UFFD_MAJOR, minor)?;
         }
+
+        self.expose_macvtap_nodes(&macvtap_nodes)?;
 
         self.jailer_cpu_time_us = get_time_us(ClockType::ProcessCpu) - self.start_time_cpu_us;
 
@@ -1468,5 +1592,29 @@ mod tests {
         let stored_pid = fs::read_to_string(pid_file_name);
         fs::remove_file(pid_file_name).unwrap();
         assert_eq!(stored_pid.unwrap(), "1");
+    }
+
+    #[test]
+    fn test_macvtap_name_validation() {
+        Env::validate_macvtap_name("macvtap0").unwrap();
+        Env::validate_macvtap_name("a123456789abcde").unwrap();
+        Env::validate_macvtap_name("").unwrap_err();
+        Env::validate_macvtap_name(".").unwrap_err();
+        Env::validate_macvtap_name("..").unwrap_err();
+        Env::validate_macvtap_name("a/b").unwrap_err();
+        Env::validate_macvtap_name("has space").unwrap_err();
+        Env::validate_macvtap_name("a:b").unwrap_err();
+        // 16 bytes is IFNAMSIZ, which the kernel rejects.
+        Env::validate_macvtap_name("a123456789abcdef").unwrap_err();
+    }
+
+    #[test]
+    fn test_resolve_missing_macvtap() {
+        let err = Env::resolve_macvtap_node("fcnosuchmt0").unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("fcnosuchmt0"),
+            "unexpected error: {message}"
+        );
     }
 }

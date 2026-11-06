@@ -6,8 +6,8 @@ should consider modifying this setup to accommodate your specific needs.
 
 > [!NOTE]
 >
-> Currently, Firecracker supports only a TUN/TAP network backend with no multi
-> queue support.
+> Firecracker supports a TUN/TAP backend and an existing macvtap device. There
+> is no multi-queue support. See [Macvtap](#macvtap).
 
 The steps in this guide assume `eth0` to be your Internet-facing network
 interface on the host. If `eth0` isn't your main network interface, you should
@@ -353,6 +353,52 @@ by simply changing the G and T variables, i.e. the guest IP and `tap` IP.
 > This allocation setup has been used successfully in the `firecracker-demo`
 > project for launching several thousand microVMs on the same host:
 > [relevant lines](https://github.com/firecracker-microvm/firecracker-demo/blob/63717c6e7fbd277bdec8e26a5533d53544a760bb/start-firecracker.sh#L45).
+
+## Macvtap
+
+`host_dev_name` may be the name of a macvtap device that already exists on the
+host. Firecracker opens that device and does not create or delete it. The probe
+matches QEMU: the interface name is resolved through sysfs to `/dev/tap<ifindex>`
+and that character device is opened. Plain tuntap names keep using
+`/dev/net/tun`.
+
+Macvtap has no hairpin mode, so the host and the guest usually cannot reach
+each other through the parent interface. Use it to put the guest on the same L2
+network as that parent NIC. Set `guest_mac` to the macvtap MAC address.
+
+```bash
+PARENT=eth0
+MAC=06:00:AC:10:00:02
+sudo ip link add link "$PARENT" name macvtap0 type macvtap mode bridge
+sudo ip link set macvtap0 address "$MAC" up
+# The Firecracker process must be able to open the device node.
+sudo chown "$(id -u):$(id -g)" /dev/tap"$(cat /sys/class/net/macvtap0/ifindex)"
+```
+
+```json
+{
+  "iface_id": "eth0",
+  "guest_mac": "06:00:AC:10:00:02",
+  "host_dev_name": "macvtap0"
+}
+```
+
+Pass the interface name, not the `/dev/tapN` path. One open attaches a single
+queue.
+
+The jailer does not mount sysfs or the host `/dev/tapN` node into the chroot.
+When Firecracker is started with the jailer, repeat `--macvtap <ifname>` once
+per device. The jailer records the device's major and minor numbers (after
+joining `--netns`, if that was requested) and creates `/dev/tap/<ifname>` inside
+the jail. `host_dev_name` stays the interface name:
+
+```bash
+jailer --id <id> --exec-file <exec_file> --uid <uid> --gid <gid> \
+       --macvtap macvtap0
+```
+
+Recreating the macvtap allocates a new device number. Restart the jailer after
+doing so. The macvtap must exist before the jailer starts.
 
 ## Advanced: Bridge-based routing
 

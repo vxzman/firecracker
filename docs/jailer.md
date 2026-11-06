@@ -26,6 +26,7 @@ jailer --id <id> \
        [--resource-limit <resource=value>] \
        [--daemonize] \
        [--new-pid-ns] \
+       [--macvtap <ifname>] \
        [--...extra arguments for Firecracker]
 ```
 
@@ -102,6 +103,12 @@ Here is an example on how to set multiple resource limits using this argument:
   `CLONE_NEWPID` flag. As a result, the jailer and the process running the exec
   file have different PIDs. The PID of the child process is stored in the jail
   root directory inside `<exec_file_name>.pid`.
+- `--macvtap <ifname>` exposes an existing macvtap device inside the jail.
+  Repeat the flag once per device. The interface must already exist. After
+  joining `--netns` (when that flag is set), the jailer reads the device's
+  major and minor numbers and creates `/dev/tap/<ifname>` in the chroot, owned
+  by `<uid>:<gid>`. Firecracker's `host_dev_name` is this same interface name.
+  See [Macvtap](network-setup.md#macvtap).
 - The jailer adheres to the "end of command options" convention, meaning all
   parameters specified after `--` are forwarded to Firecracker. For example,
   this can be paired with the `--config-file` Firecracker argument to specify a
@@ -143,6 +150,8 @@ After starting, the Jailer goes through the following operations:
   and call `chroot` into the current directory.
 - Use `mknod` to create a `/dev/net/tun` equivalent inside the jail.
 - Use `mknod` to create a `/dev/kvm` equivalent inside the jail.
+- For each `--macvtap` argument, use `mknod` to create `/dev/tap/<ifname>`
+  inside the jail from the major and minor numbers resolved before `chroot`.
 - Use `chown` to change ownership of the `<chroot_dir>` (root path `/` as seen
   by the jailed firecracker), `/dev/net/tun`, `/dev/kvm`. The ownership is
   changed to the provided `<uid>:<gid>`.

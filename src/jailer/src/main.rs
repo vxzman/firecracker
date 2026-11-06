@@ -104,6 +104,8 @@ pub enum JailerError {
     MkdirOldRoot(io::Error),
     #[error("Failed to create {1} via mknod inside the jail: {0}")]
     MknodDev(io::Error, String),
+    #[error("Macvtap: {0}")]
+    Macvtap(String),
     #[error("Failed to bind mount the jail root directory: {0}")]
     MountBind(io::Error),
     #[error("Failed to change the propagation type to slave: {0}")]
@@ -233,6 +235,11 @@ pub fn build_arg_parser() -> ArgParser<'static> {
                 .takes_value(false)
                 .help("Print the binary version number."),
         )
+        .arg(Argument::new("macvtap").allow_multiple(true).help(
+            "Existing macvtap interface to expose inside the jail. Repeat for each device. \
+             The jailer creates /dev/tap/<ifname> in the chroot; pass the same name as \
+             Firecracker's host_dev_name.",
+        ))
 }
 
 // It's called writeln_special because we have to use this rather convoluted way of writing

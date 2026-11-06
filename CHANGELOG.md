@@ -10,6 +10,11 @@ and this project adheres to
 
 ### Added
 
+- Added support for using an existing host macvtap device as
+  `host_dev_name`. Firecracker opens `/dev/tap<ifindex>` and does not create or
+  delete the interface. Under the jailer, pass `--macvtap <ifname>` once per
+  device so the device node is created inside the chroot. See
+  [Macvtap](docs/network-setup.md#macvtap).
 - [#6226](https://github.com/firecracker-microvm/firecracker/pull/6226),
   [#6227](https://github.com/firecracker-microvm/firecracker/pull/6227),
   [#6228](https://github.com/firecracker-microvm/firecracker/pull/6228),
